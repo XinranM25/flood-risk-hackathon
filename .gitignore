@@ -1,0 +1,58 @@
+# ── Data files (never upload — too large) ────────────────────────────────────
+Data/
+*.nc
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# ── Model checkpoints ─────────────────────────────────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.joblib
+
+# ── Generated reports & figures (reproducible from notebooks) ─────────────────
+reports/figures/
+reports/eda_summary.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+# Uncomment below if you want to strip notebook outputs before committing
+# *.ipynb
+
+# ── OS clutter ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+.env
+*.key
+secrets.yaml
