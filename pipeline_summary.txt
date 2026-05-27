@@ -1,0 +1,333 @@
+# Pipeline Summary: Data Cleaning and Feature Engineering
+## Group 8 Flood Risk Prediction
+
+This document covers the full data pipeline from raw NetCDF files through to model-ready parquet outputs. It replaces the earlier `data_cleaning_summary.md` and `feature_engineering_summary.md` files and reflects the corrected pipeline (see "Critical Fix Applied" below).
+
+---
+
+## Project Context
+
+Group 8 trains on the **Severn** region and tests on **Northumbria**. The task is pixel-level flood risk classification: given terrain features and weather data, predict the categorical flood risk (0 = no risk, 1 = very low, 2 = low, 3 = medium, 4 = high) at five flood depths (0.2m, 0.3m, 0.6m, 0.9m, 1.2m) for each 20m x 20m pixel. Spatial correlation must be addressed explicitly (the project brief forbids treating pixels as i.i.d.).
+
+## Raw Data Files
+
+| File | Contents | Resolution |
+|---|---|---|
+| `flood_risk_terrain_severn.nc` | Terrain features + flood risk labels | 20m x 20m, 10,249 x 8,192 pixels (~84M total) |
+| `flood_risk_terrain_northumbria.nc` | Terrain features + flood risk labels | 20m x 20m, 8,327 x 5,527 pixels (~46M total) |
+| `era5_land_severn.nc` | Daily weather data, Jan 2015 to Dec 2024 | ~9.45 x 9.3 km, 414 grid cells in bounding box |
+| `era5_land_northumbria.nc` | Daily weather data, Jan 2015 to Dec 2024 | ~9.45 x 9.3 km, 234 grid cells in bounding box |
+
+All data uses the EPSG:3035 projected coordinate system. Coordinates are labeled `projection_y_coordinate` and `projection_x_coordinate` in the ERA5 files, and `y` and `x` in the terrain files.
+
+---
+
+## Critical Fix Applied: ERA5 Spatial Aggregation
+
+The original pipeline collapsed all ERA5 spatial pixels into a single regional mean/max/sum per day, producing just one row per day per region. This permanently destroyed within-region spatial variation in weather. The feature engineering step then computed rolling and percentile features on those collapsed series, producing a final output of just two rows of weather features (one per region). Every terrain pixel in a region received identical weather values.
+
+This was incorrect for two reasons:
+
+1. The project brief (slide 24) prescribes spatial z-scores, which require per-pixel weather data. Collapsing across space made spatial z-scores impossible.
+2. Weather varies meaningfully within each region. The 99th percentile of daily precipitation differs by 4.7mm (Severn) and 5.7mm (Northumbria) across ERA5 pixels within each region. That variation is real and predictive.
+
+The fixed pipeline keeps the full ERA5 spatial grid, computes all weather features per ERA5 pixel, and spatially joins each terrain pixel to its nearest ERA5 pixel via a KDTree. This produces 212 distinct sets of weather features for Severn and 119 for Northumbria instead of 1 per region.
+
+---
+
+## Notebook 1: Data Cleaning
+
+### Terrain Cleaning (unchanged from original)
+
+All terrain cleaning was performed lazily using xarray with dask chunking (`chunks={"x": 2000, "y": 2000}`) to keep peak memory usage low. The following steps were applied identically to both regions.
+
+#### 1. Dropped `flow_dir`
+
+The variable `flow_dir` was removed. Per the project briefing (slide 15), `flow_dir` is a stepping stone used to derive `flow_acc` and should not be used directly in modeling.
+
+#### 2. Filled risk variable NaNs with 0 and cast to int8
+
+The five risk outcome variables (`risk_0_2m`, `risk_0_3m`, `risk_0_6m`, `risk_0_9m`, `risk_1_2m`) contained NaN for pixels with no flood risk. NaN was recoded to 0, creating a fifth category (0 = no risk). All five were cast from float32 to int8, saving 75% memory per column.
+
+After cleaning, risk variables have zero nulls in both regions. The class distribution is heavily imbalanced: roughly 90--91% of valid Severn pixels and 93--94% of valid Northumbria pixels are class 0.
+
+#### 3. Cleaned `waw` sentinel values
+
+The water and wetness variable uses sentinel codes that are not real categories:
+
+- 253 (sea water): recoded to 5 (kept as a distinct category, useful for coastal flood prediction)
+- 254 (unclassifiable): set to NaN
+- 255 (outside area): set to NaN
+
+After cleaning, `waw` has valid values 0 through 5. Note: the project brief documents the range as 0--4 (five classes: dry, permanent water, temporary water, permanent wet, temporary wet). Value 5 is an extension for sea water pixels. Both regions contain sea water pixels.
+
+#### 4. Log-transformed `flow_acc`
+
+Flow accumulation counts upstream cells draining into each pixel. The distribution is extremely right-skewed (max ~464M for Severn, ~143M for Northumbria, min 20 in both). A `log1p` transformation was applied and stored as `log_flow_acc` (float32). The original `flow_acc` was retained in the NetCDF.
+
+#### 5. Z-score normalized `dtm` per region
+
+Raw elevation (`dtm`, in decimeters) has very different ranges across regions:
+
+- Severn: -48 to 7,001 dm (mean 1,084, std 725)
+- Northumbria: -620 to 8,900 dm (mean 1,969, std 1,532)
+
+Each region was z-score normalized independently using `(dtm - mean) / std`, producing `dtm_zscore` (float32). This preserves relative terrain shape while removing region-specific offsets and scales, enabling the model to generalize from training (Severn) to testing (Northumbria).
+
+Note: the resulting z-scores are asymmetric (Severn range: -1.56 to +8.16) because the elevation distribution is right-skewed. For models sensitive to input distributions (e.g. neural networks without batch normalization), consider log-transforming `dtm` before z-scoring. For tree-based models this does not matter.
+
+#### 6. Added `valid_pixel` mask
+
+A boolean mask defined as pixels where both `dtm` and `waw` are not null. Approximately 58% of Severn pixels and 53.5% of Northumbria pixels are invalid (they fall within the bounding rectangle but outside the actual region boundary).
+
+- Severn valid pixels: 35,278,130 / 83,959,808 (42.0%)
+- Northumbria valid pixels: 21,391,824 / 46,023,329 (46.5%)
+
+### ERA5 Weather Cleaning (fixed version)
+
+The ERA5 data was opened with xarray, the spatial dimensions were stacked into a flat pixel index, and the full (time, pixel) structure was saved as a tidy parquet file with one row per (day, ERA5 pixel). No spatial aggregation was performed. Coordinates were renamed to `proj_y` and `proj_x` to match the terrain parquet naming convention.
+
+Two non-weather columns (`spatial_ref`, a CRS artifact, and `number`, an ERA5 ensemble dimension with a single constant value) were dropped in the feature engineering notebook before processing.
+
+Approximately 49% of ERA5 grid cells in each bounding box fall outside the actual region boundary and contain all-NaN weather values. These were identified and filtered prior to feature engineering:
+
+- Severn: 202 of 414 bounding box pixels are outside the region. **212 valid ERA5 pixels remain.**
+- Northumbria: 115 of 234 bounding box pixels are outside the region. **119 valid ERA5 pixels remain.**
+
+After filtering, zero nulls remain in all weather variables for both regions.
+
+### Cleaned Output Files
+
+| File | Format | Description |
+|---|---|---|
+| `terrain_severn_clean.nc` | NetCDF | Cleaned terrain grid for Severn (load with `chunks=` for memory safety) |
+| `terrain_northumbria_clean.nc` | NetCDF | Cleaned terrain grid for Northumbria |
+| `era5_severn_daily_spatial.parquet` | Parquet | One row per (day, ERA5 pixel) for Severn. Shape: (1,512,342, 20) before filtering |
+| `era5_northumbria_daily_spatial.parquet` | Parquet | One row per (day, ERA5 pixel) for Northumbria. Shape: (854,802, 20) before filtering |
+
+---
+
+## Notebook 2: Feature Engineering
+
+### ERA5 Weather Feature Engineering (per spatial pixel)
+
+All weather features were computed per ERA5 spatial pixel, not per region. The computation used a vectorized "wide pivot" pattern: for each weather variable, the data was pivoted so that rows represented dates and columns represented pixel ids. Pandas rolling, quantile, and groupby operations were then applied across all pixels simultaneously.
+
+After filtering to valid pixels (212 Severn, 119 Northumbria), the following features were computed:
+
+#### 1. Rolling window precipitation and runoff accumulations (6 features)
+
+For `tp` (total precipitation) and `sro` (surface runoff), rolling sums were computed over 5, 10, and 15-day windows across the full 10-year daily time series. The maximum of each rolling sum was taken per pixel, capturing the worst sustained rainfall/runoff event each pixel experienced.
+
+Features: `max_rolling_5d_tp`, `max_rolling_10d_tp`, `max_rolling_15d_tp`, `max_rolling_5d_sro`, `max_rolling_10d_sro`, `max_rolling_15d_sro`.
+
+Validation: the monotonic relationship (5d <= 10d <= 15d) holds for every pixel in both regions. Precipitation values are physically plausible (max 5-day event ~100mm, consistent with major UK rainfall events). Surface runoff is roughly 10--15x smaller than precipitation, consistent with expected runoff coefficients.
+
+#### 2. Soil moisture extremes (6 features)
+
+A 7-day rolling average of `swvl1_mean` (daily mean volumetric soil water content, 0--7cm depth) was computed per pixel. Both the maximum (peak sustained saturation) and minimum (peak sustained depletion) were extracted. The same was done for `swvl1_max` (daily max soil moisture). Overall mean and standard deviation were also included.
+
+Features: `max_rolling_7d_swvl1_mean`, `min_rolling_7d_swvl1_mean`, `swvl1_mean_overall`, `swvl1_std_overall`, `max_rolling_7d_swvl1_max`, `min_rolling_7d_swvl1_max`.
+
+Validation: all values fall within the physically valid 0--1 range for volumetric water content. Max > mean > min holds for every pixel. The `swvl1_max` features are always >= the corresponding `swvl1_mean` features (daily max >= daily mean). Values are consistent with UK clay-loam soils (field capacity ~0.35--0.50, wilting point ~0.15--0.20).
+
+#### 3. Percentile-based features (12 features)
+
+For `tp` and `sro`, the 50th, 90th, 95th, and 99th percentiles were computed per pixel across the full 10-year daily time series, along with overall mean and standard deviation.
+
+Features (per variable): `{var}_p50`, `{var}_p90`, `{var}_p95`, `{var}_p99`, `{var}_overall_mean`, `{var}_overall_std`.
+
+Validation: monotonic percentile ordering (p50 <= p90 <= p95 <= p99) holds for every pixel. Mean exceeds median for both variables (expected for right-skewed precipitation/runoff distributions). Annual precipitation implied by `tp_overall_mean` is ~887mm/year for Severn, consistent with UK climatology.
+
+#### 4. Seasonal extreme features (36 features)
+
+Each day was assigned to a meteorological season (DJF, MAM, JJA, SON). For each of 3 variables (`tp`, `sro`, `swvl1_mean`), the mean, max, and standard deviation were computed per season per pixel.
+
+Features: `{var}_{season}_{stat}` for all combinations of 3 variables, 4 seasons, and 3 statistics.
+
+Key findings:
+
+- Autumn (SON) produces the highest precipitation means and single-day maximums in both regions, consistent with UK Atlantic frontal weather systems.
+- Spring (MAM) is the driest season by mean daily precipitation.
+- These patterns hold at the per-pixel level, not just regionally.
+
+#### 5. Spatial z-score features (17 features)
+
+This feature family implements the suggestion from slide 24 of the project brief. For each day, each pixel's value was normalized relative to that day's regional mean and standard deviation:
+
+`z_score[pixel, day] = (value[pixel, day] - regional_mean[day]) / regional_std[day]`
+
+A minimum threshold was applied to suppress artificially inflated z-scores on near-dry days (when regional std is near zero): `tp` threshold = 1e-4 m, `sro` threshold = 1e-5 m, `swvl1_mean` threshold = 0.0.
+
+Per-pixel time aggregates were then computed from the daily z-score series.
+
+Features per variable: `{var}_spatial_z_mean`, `{var}_spatial_z_max` (tp and swvl1_mean only), `{var}_spatial_z_p95`, `{var}_spatial_z_p99`, `{var}_n_days_z_gt_1`, `{var}_n_days_z_gt_2`.
+
+`sro_spatial_z_max` was intentionally excluded because surface runoff is extremely spatially concentrated during individual events, producing a near-zero regional standard deviation and z-scores exceeding 10 regardless of any threshold. The mean, p95, p99, and day-count features remain robust and informative.
+
+Key findings:
+
+- `swvl1_mean_spatial_z_mean` reveals strong persistent spatial structure. Some ERA5 pixels are consistently 1+ standard deviations above the regional soil moisture average (91.5% of days for the wettest pixel), indicating they sit over permanently saturated ground such as a river channel or floodplain. Other pixels are consistently below average. This feature captures chronic wetness anomalies that are directly relevant to flood risk.
+- `tp_spatial_z_mean` shows smaller but meaningful variation (range roughly -0.5 to +0.5), reflecting geographic rainfall gradients within each region.
+
+#### ERA5 feature total: 77 weather features + 4 identifiers = 81 columns per region
+
+### Terrain Feature Engineering
+
+The cleaned terrain NetCDFs were flattened into tabular parquet files, filtering to `valid_pixel == True` only. Processing was done in row chunks of 500 along the y-axis to keep memory usage manageable. The following fixes were applied during flattening:
+
+#### 6. `rciw` converted to binary `is_waterway`
+
+The river/canal/inland water variable was 99.4--99.6% NaN among valid pixels. No canal pixels (value 1) existed in either region; only inland water (2) and river (3) were present. NaN was filled with 0 and any non-NaN value was set to 1, creating a binary `is_waterway` flag.
+
+Waterway pixel counts: Severn 139,169 (0.39%), Northumbria 123,282 (0.58%).
+
+#### 7. `imd` range clipped to 0--100
+
+The imperviousness variable ranged 0--100 in Severn but 0--255 in Northumbria due to raw byte encoding. All values were clipped to 0--100 during flattening. The cleaned terrain NetCDF still contains the uncorrected Northumbria values; the clip is applied only in the parquet output.
+
+#### 8. `clc_type` kept as integer
+
+The land cover classes were kept as integer codes. Severn has 31 unique classes, Northumbria has 30. They mostly overlap with the following differences:
+
+- Severn only: classes 222 and 242 (2 classes)
+- Northumbria only: class 332 (1 class)
+
+Since training is on Severn, the model will encounter class 332 at test time without having seen it during training. This must be handled explicitly (e.g. mapping unseen classes to a dedicated "unknown" code, or using an embedding approach that can generalize).
+
+#### 9. `waw` NaN filled with 0
+
+Any remaining NaN values in the water and wetness variable were filled with 0 (dry).
+
+#### 10. Spatial join to nearest ERA5 pixel (new step)
+
+A `cKDTree` was built on the ERA5 pixel centroids (proj_y, proj_x) for each region. For every terrain pixel, the index of the nearest ERA5 pixel was computed and stored as `era5_pixel_idx` (int32). This column serves as a lookup key into the ERA5 pixel feature parquet at training time.
+
+Validation: all 212 Severn ERA5 pixels and all 119 Northumbria ERA5 pixels are referenced by at least one terrain pixel. No orphaned indices. The `era5_pixel_idx` range is 0--211 for Severn and 0--118 for Northumbria.
+
+---
+
+## Output Files
+
+| File | Format | Rows | Columns | Size | Description |
+|---|---|---|---|---|---|
+| `severn_terrain_ready.parquet` | Parquet | 35,278,130 | 14 | ~1.2 GB | Training data: per-pixel terrain features + risk targets + ERA5 pixel index |
+| `northumbria_terrain_ready.parquet` | Parquet | 21,391,824 | 14 | ~0.7 GB | Test data: per-pixel terrain features + risk targets + ERA5 pixel index |
+| `era5_severn_pixel_features.parquet` | Parquet | 212 | 81 | ~70 KB | Weather features: one row per valid ERA5 pixel for Severn |
+| `era5_northumbria_pixel_features.parquet` | Parquet | 119 | 81 | ~40 KB | Weather features: one row per valid ERA5 pixel for Northumbria |
+
+### Terrain parquet columns (14)
+
+`proj_y`, `proj_x` (EPSG:3035 coordinates), `dtm_zscore`, `log_flow_acc`, `imd`, `waw`, `clc_type`, `risk_0_2m`, `risk_0_3m`, `risk_0_6m`, `risk_0_9m`, `risk_1_2m`, `is_waterway`, `era5_pixel_idx`.
+
+### ERA5 pixel feature parquet columns (81)
+
+`pixel_id`, `proj_y`, `proj_x`, `region`, then 77 weather feature columns grouped as: 6 rolling, 6 soil moisture, 12 percentile, 36 seasonal, 17 spatial z-score.
+
+### How to join at training time
+
+The weather features are stored separately from the terrain to avoid inflating the multi-gigabyte terrain file with 77 redundant columns (each of the ~35M Severn terrain pixels would carry an identical copy of its ERA5 pixel's features). The join is performed in memory at training time:
+
+```python
+import pandas as pd
+
+terrain = pd.read_parquet("severn_terrain_ready.parquet")
+weather = pd.read_parquet("era5_severn_pixel_features.parquet")
+weather_lookup = weather.set_index("pixel_id")
+
+merged = terrain.merge(
+    weather_lookup, left_on="era5_pixel_idx", right_index=True,
+    suffixes=("", "_weather"),
+)
+# merged shape: (35_278_130, 94)
+# 14 terrain columns + 80 weather columns (81 minus pixel_id used as index)
+```
+
+For memory-constrained training, the lookup can be done in batches instead:
+
+```python
+weather_matrix = weather_lookup.drop(columns=["proj_y", "proj_x", "region"]).values
+# shape: (212, 77) -- small array
+
+for batch in terrain_batches:
+    indices = batch["era5_pixel_idx"].values
+    batch_weather = weather_matrix[indices]  # vectorized lookup, no merge overhead
+```
+
+---
+
+## Validation Results
+
+### Null counts
+
+Zero nulls across all four output files.
+
+### Class distribution
+
+| Risk level | Severn class 0 (no risk) | Northumbria class 0 (no risk) |
+|---|---|---|
+| risk_0_2m | 90.6% | 93.7% |
+| risk_0_3m | 90.7% | 93.7% |
+| risk_0_6m | 90.8% | 93.9% |
+| risk_0_9m | 90.9% | 93.9% |
+| risk_1_2m | 91.3% | 93.9% |
+
+Class imbalance increases with flood depth. Northumbria has proportionally fewer at-risk pixels than Severn across all depths. Stratified sampling or class weighting will be essential during training.
+
+Notable distribution shape: in Severn `risk_0_2m`, class 4 (high risk, 3.6%) is actually larger than classes 1, 2, and 3. This reflects a bimodal distribution where terrain is either at high risk (on the floodplain) or no risk (away from it), with relatively few pixels in intermediate categories.
+
+### Feature range consistency
+
+| Feature | Severn | Northumbria |
+|---|---|---|
+| `dtm_zscore` | [-1.56, 8.16] | [-1.69, 4.52] |
+| `log_flow_acc` | [3.04, 19.96] | [3.04, 18.78] |
+| `imd` | [0, 100] | [0, 100] |
+| `waw` | [0, 5] | [0, 5] |
+| `clc_type` | [111, 523] | [111, 523] |
+| `is_waterway` | [0, 1] | [0, 1] |
+
+Ranges are comparable across regions. The z-score normalization of `dtm` and the log transformation of `flow_acc` have made the two most region-dependent features (elevation and drainage area) transferable.
+
+### Spatial weather variation
+
+| Region | tp_p99 min across pixels | tp_p99 max across pixels | Spread |
+|---|---|---|---|
+| Severn | 0.0162 m | 0.0209 m | 0.0047 m (4.7 mm) |
+| Northumbria | 0.0173 m | 0.0230 m | 0.0057 m (5.7 mm) |
+
+Confirms that the per-pixel weather features capture meaningful within-region spatial variation. The old collapsed pipeline produced zero spread.
+
+### ERA5 pixel index integrity
+
+Every `era5_pixel_idx` value in the terrain parquets maps to a valid row in the corresponding ERA5 pixel feature parquet. No missing references.
+
+---
+
+## Key Observations for Modeling
+
+1. **Class imbalance is severe.** Class 0 (no risk) dominates at 90--94% across all depths. Class weighting, stratified sampling, or focal loss will be needed. The bimodal distribution in Severn (class 4 > classes 1/2/3 for shallow floods) means standard inverse-frequency weights may overcorrect for the rarest intermediate classes.
+
+2. **Spatial correlation must be addressed.** The project brief explicitly states pixels cannot be treated as i.i.d. CNNs and transformers handle spatial correlation natively. For tree-based models, engineered spatial context features (e.g. neighborhood averages, distance to nearest high-risk pixel) would be needed.
+
+3. **`clc_type` class 332 is unseen in training.** It exists only in Northumbria. The model must handle this at test time -- either by mapping it to "unknown", by using an embedding with a fallback, or by grouping land cover classes into broader categories that are shared across regions.
+
+4. **`dtm_zscore` is right-skewed, not normally distributed.** Some high-elevation pixels have z-scores above 8. For neural networks, consider applying a log or Box-Cox transformation before z-scoring, or using batch normalization to handle the skew implicitly.
+
+5. **Weather features are constant within each ERA5 pixel's footprint.** Each ERA5 pixel covers a ~9.5 x 9.3 km area, containing roughly 470 x 465 terrain pixels. All terrain pixels within that footprint share the same 77 weather features. This means weather features vary on a coarser spatial scale than terrain features. For CNNs operating on local patches, the weather values will be constant or near-constant within a patch, which may limit their usefulness in a convolutional architecture. Consider feeding weather features as global conditioning rather than as spatial channels.
+
+6. **Computational restriction is available.** The project brief (slide 25) explicitly states that the full region does not need to be used for training. A spatial subset (e.g. a rectangular crop or a stratified sample) may be sufficient, especially for computationally intensive models like CNNs.
+
+7. **Additional data sources may help.** The project brief (slides 31--32) mentions Defra flood defenses (AIMS database), OpenStreetMap infrastructure features, and Sentinel satellite imagery as potential improvements to the bare-earth terrain features.
+
+---
+
+## What Still Needs to Be Done
+
+1. **Build the model.** Select an architecture (CNN, transformer, or tree-based) and train on Severn terrain + weather features, predicting one or more risk columns. The brief recommends depth over width: pick one model and maximize its performance.
+2. **Address class imbalance.** Implement class weighting, stratified sampling, or focal loss.
+3. **Handle `clc_type` encoding.** One-hot encode, embed, or group into broader categories. Ensure class 332 is handled at test time.
+4. **Evaluate on Northumbria.** Train exclusively on Severn, test on Northumbria. No information from the test region should leak into training.
+5. **Consider additional data sources.** Defra flood defenses, OSM, Sentinel imagery per the project brief.
+6. **Prepare regulatory analysis.** The second task covers IFRS S2, CSRD, and DACH-region reporting requirements (slides 28--30).
+7. **Prepare presentation.** 20-minute presentation with 30-minute Q&A, due Friday 29 May at 07:00. Code and a PDF regulatory document must also be submitted.
