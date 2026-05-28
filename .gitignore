@@ -20,6 +20,11 @@ checkpoints/
 reports/figures/
 reports/eda_summary.json
 
+# ── Keep model results (small files, useful for teammates & presentation) ──────
+!models/results/*.json
+!models/results/*.csv
+!models/results/*.png
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
